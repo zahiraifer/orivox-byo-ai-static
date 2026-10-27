@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Someone Else's Model at the Controls: Opening an AI Website Editor to the Customer's Own AI</title>
+<meta name="author" content="Zahi Raifer">
+<style>
+body{max-width:42rem;margin:2rem auto;padding:0 1rem;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.65;color:#1a1a1a;background:#fff}
+h1{line-height:1.25;font-size:2rem} h2{margin-top:2.2rem} h3{margin-top:1.6rem}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em;background:#f3f3f3;padding:.1em .3em;border-radius:3px}
+a{color:#0b57d0} hr{border:0;border-top:1px solid #ddd;margin:2.5rem 0}
+</style>
+</head>
+<body>
+<h1>Someone Else's Model at the Controls: Opening an AI Website Editor to the Customer's Own AI</h1>
+<p><em>By Zahi Raifer</em></p>
+<p>Most AI products assume they own the model. The prompt is ours, the model is ours, and every decision about what to change comes from a system we built and tuned. That assumption is comfortable, and it quietly shapes the whole architecture.</p>
+<p>Orivox, the Hebrew-first website builder I work on, has a second way in that breaks the assumption on purpose. Besides the owner's chat in our web app, there is a remote MCP server that lets an owner build and edit their Orivox site from their own Claude, on their own subscription. On that path there is no model of ours in the loop at all. Their AI does the reasoning; our side only executes.</p>
+<p>This post is about what it takes to put that door on the public internet without weakening anything behind it.</p>
+<h2>Why a second door was cheap to add</h2>
+<p>The honest answer is that we did not design the MCP server first. We designed an editing engine where the model never writes files, and the MCP door fell out of that decision.</p>
+<p>In the normal flow, our planner (Gemini) receives the assembled page and replies either in words or with a tool call. The main tool takes a list of operations drawn from a fixed grammar of 14 verbs: <code>set_text</code>, <code>replace_html</code>, <code>insert_before</code>, <code>insert_after</code>, <code>append_html</code>, <code>prepend_html</code>, <code>remove</code>, <code>set_attr</code>, <code>remove_attr</code>, <code>add_class</code>, <code>remove_class</code>, <code>move_before</code>, <code>move_after</code> and <code>move_to_page</code>. Each operation targets an element by its <code>data-ai-id</code>, a short unique address Python assigns when the site is built. Python then applies the list with BeautifulSoup, runs its checks, saves the page and commits the change to the project's Git repository.</p>
+<p>Because the interface between "the thing that thinks" and "the thing that writes" is a list of operations rather than a file, it does not matter much who produces the list. The MCP edit tool accepts the same 14 operations. A list that arrives from an owner's Claude is applied exactly like one from Gemini: the same deterministic checks, the same Git commit, the same transcript.</p>
+<p>That is the core idea of this article. If your model's output is a narrow, validated vocabulary, swapping in a model you do not control stops being a security project and becomes an integration.</p>
+<h2>What an outside model is never trusted with</h2>
+<p>Opening a door to models we do not control meant deciding, in advance, what that door can never do. Three choices carry most of the weight.</p>
+<h3>1. The MCP server cannot write to the database</h3>
+<p>The MCP server holds no database write credentials. It reaches the rest of the system the same way the rest of the system reaches itself: over HTTP, calling the editing service and the web app. The only direct database access it has is a single read-only view used to identify the caller.</p>
+<p>So even a fully compromised MCP process has no direct route to accounts, credits or project records. Everything it wants to change goes through a service that already enforces its own rules.</p>
+<h3>2. The web app stays the authority</h3>
+<p>In Orivox every piece of state has one owner. The editing service owns each project's Git history and the chat transcript. The web app owns accounts, credits, publishing and domains. The MCP server owns nothing.</p>
+<p>That shows up clearly in how the MCP door creates a project. The order is fixed:</p>
+<ol>
+<li>a quota check,</li>
+<li>a project record in the web app,</li>
+<li>the files in the editing service,</li>
+<li>finalize,</li>
+<li>usage.</li>
+</ol>
+<p>The web app also issues the OAuth tokens and decides quota and plan. An outside AI can ask for a new site; whether the owner is allowed one is a business decision, and it stays with the business data. The plan rules live in one place, so there is no second copy of them to drift.</p>
+<h3>3. The guards do not care who proposed the change</h3>
+<p>Every save in Orivox passes through Python checks that hold regardless of what the model proposes: a save may never empty a live page, moved text keeps every sentence, a whole-page rewrite keeps every section the owner did not name, a page is read before it is written, a claim of success needs a real change, and others. Only the server decides whether a turn is saved.</p>
+<p>Those checks were written for our own planner, but nothing in them depends on it. That is exactly why they transfer. A rule that says "this cannot happen" is more useful than a prompt that says "please don't", and it is the only kind of rule that works on a model whose prompt you never see.</p>
+<h2>The awkward case: a write that succeeded, then something else failed</h2>
+<p>The most interesting design decision on this path is about failure after success.</p>
+<p>Creating a project ends with recording usage. Suppose the files are already written and the project exists, and then metering fails. A conventional API would return an error. On an AI tool interface that is a trap: an agent that sees an error will very reasonably try again, and "try again" for a create call means a second site.</p>
+<p>So the rule is that a completed write is always reported as done. If usage metering fails after the files are written, the tool still returns success. The AI never retries, and the owner never ends up with a duplicate.</p>
+<p>The general lesson is that tool results for AI callers are instructions as much as they are status codes. The same thinking runs through the in-house editor, where every message the system sends back to the planner tells it what to do next so it can correct course on its own. When the caller is an agent, an error means "do something", so you only return one when doing something is actually the right response.</p>
+<h2>Keeping the door stateless</h2>
+<p>The MCP server keeps no session state between calls. Any instance can serve any request, and a restart costs at most the one request in flight.</p>
+<p>That matters more for this door than for most of the system. Its callers are agents running on someone else's schedule, and they do not know or care that we are mid-release. Because the server remembers nothing, the conversation lives with the owner's AI, the site's history lives in the editing service's Git repository, and authority lives in the web app.</p>
+<p>We also check it from the outside. Every five minutes a probe walks the AI connector end to end, from discovery and sign-in to a real tool call, and emails an incident report on any failure and on recovery.</p>
+<h2>What this looks like for the owner</h2>
+<p>From the owner's side the two doors feel different. One is a chat in our app, in Hebrew or English. The other is their own Claude, with their own subscription.</p>
+<p>Underneath, they are the same product. The same element addresses, the same operation grammar, the same checks on every save, the same Git commit per turn, the same Redis project lock, so two writers never interleave on one site. A change made from Claude can be undone exactly like a change made from our chat, because undo is a Git restore either way.</p>
+<h2>Takeaways for anyone building something similar</h2>
+<ul>
+<li><strong>Make the model's output a vocabulary, not an artifact.</strong> A list of named operations can be validated, logged and replayed, and it does not care which model wrote it.</li>
+<li><strong>Give the public-facing door no write credentials of its own.</strong> Let it go through the same services everyone else uses.</li>
+<li><strong>Keep authority where the business data lives.</strong> Quota, plan and tokens belong to one service, not to every entry point.</li>
+<li><strong>Design tool results for agents that retry.</strong> Once a write has really happened, report it as done.</li>
+<li><strong>Keep the edge stateless.</strong> Let history, conversation and authority live in places built to hold them.</li>
+</ul>
+<p>If you'd like to see both doors yourself, <a href="https://orivox.org">Orivox</a> has a free plan that includes one site, plus an optional done-for-you service for owners who would rather have someone build it for them.</p>
+<hr />
+<p><strong>About the author:</strong> Zahi Raifer is a software developer with 23 years of experience in AI, Python, .NET and databases, and the founder of Orivox. He works on product development, not sales.</p>
+<p><em>AI disclosure: An AI assistant helped draft this article from Orivox's engineering notes; the author reviewed and edited it.</em></p>
+</body>
+</html>
